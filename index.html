@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Desktop/WebXR Environment - PDB Drag Plane Fix</title>
+    <style>
+        html, body {
+            overflow: hidden;
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', sans-serif;
+        }
+        #renderCanvas {
+            width: 100%;
+            height: 100%;
+            touch-action: none;
+            display: block;
+            outline: none;
+        }
+    </style>
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+    <script src="https://cdn.babylonjs.com/inspector/babylon.inspector.bundle.js"></script>
+</head>
+<body>
+    <canvas id="renderCanvas"></canvas>
+
+    <script>
+        // --- Configuration Constants ---
+        const SHOW_INSPECTOR_BY_DEFAULT = true;
+        const DEFAULT_HAND_PLANE_DISTANCE = 10;
+        const HAND_MODEL_URL = "https://cdn.aframe.io/controllers/hands/leftHandLow.glb";
+        const HAND_ANIMATION_KEYWORDS = { 
+            IDLE: "idle", 
+            POINT: "point",
+            FIST: "fist",
+            GRASP: "grasp"
+        };
+        const HAND_SNAP_OFFSET_FACTOR = 0.015; 
+        const DRAGGABLE_BOX_NAME = "draggableBox";
+
+        // Debug Ray Constants
+        const DEBUG_RAY_DEFAULT_COLOR = new BABYLON.Color3(1, 0, 0); 
+        const DEBUG_RAY_DRAG_CLICK_COLOR = new BABYLON.Color3(0, 1, 0); 
+        const DEBUG_RAY_LENGTH = 20;
+        const DEBUG_RAY_DURATION = 2000; 
+        const DEBUG_RAY_DURATION_DRAG_CLICK = 3000; 
+        // --- End Configuration Constants ---
+
+        // --- DesktopHand Object Definition ---
+        function createDesktopHand(scene, modelUrl, animKeywordsConfig) {
+            let rootMesh = null;
+            let animations = {}; 
+            let currentGesture = null; 
+            let currentAnimationGroup = null; 
+
+            const handObject = {
+                isLoaded: false,
+                loadAsync: async () => {
+                    try {
+                        const result = await BABYLON.SceneLoader.ImportMeshAsync("", modelUrl, "", scene);
+                        if (!result.meshes || result.meshes.length === 0) {
+                            console.error("Hand model loaded, but no meshes found.");
+                            return false;
+                        }
+                        rootMesh = result.meshes[0];
+                        rootMesh.name = "desktopHand_RootMesh";
+                        rootMesh.isPickable = false;
+                        rootMesh.getChildMeshes(true).forEach(m => m.isPickable = false);
+                        rootMesh.scaling.setAll(15);
+                        rootMesh.rotationQuaternion = null; 
+                        rootMesh.rotation.x = Math.PI / 2;
+                        rootMesh.rotation.y = Math.PI;
+                        rootMesh.isVisible = false; 
+
+                        if (result.animationGroups && result.animationGroups.length > 0) {
+                            result.animationGroups.forEach(ag => ag.stop());
+                            for (const key in animKeywordsConfig) {
+                                const keyword = animKeywordsConfig[key];
+                                const foundAnim = result.animationGroups.find(ag => 
+                                    ag.name.toLowerCase().includes(keyword.toLowerCase()) && 
+                                    !ag.name.toLowerCase().includes("pose")
+                                );
+                                if (foundAnim) {
+                                    animations[keyword] = foundAnim;
+                                    animations[keyword].loopAnimation = false; 
+                                    console.log(`DesktopHand: Found animation for '${keyword}': ${foundAnim.name}`);
+                                } else {
+                                    console.warn(`DesktopHand: Animation for keyword '${keyword}' not found.`);
+                                }
+                            }
+                        } else {
+                            console.warn("DesktopHand: No animation groups found in the loaded hand model.");
+                        }
+                        handObject.isLoaded = true;
+                        console.log("DesktopHand model and animations loaded.");
+                        return true;
+                    } catch (error) {
+                        console.error("Error loading hand model:", error);
+                        return false;
+                    }
+                },
+                setPosition: (positionVec3) => {
+                    if (rootMesh && handObject.isLoaded) {
+                        rootMesh.position.copyFrom(positionVec3);
+                    }
+                },
+                setVisible: (visible) => {
+                    if (rootMesh && handObject.isLoaded) {
+                        rootMesh.isVisible = visible;
+                    }
+                },
+                isVisible: () => { return rootMesh ? rootMesh.isVisible : false; },
+                makeGesture: (gestureName, loop = false, speed = 1.0, onEndCallback = null) => {
+                    if (!rootMesh || !handObject.isLoaded || !animations[gestureName]) {
+                        if (gestureName === animKeywordsConfig.IDLE && currentAnimationGroup) { 
+                           currentAnimationGroup.stop();
+                           currentAnimationGroup = null;
+                           currentGesture = animKeywordsConfig.IDLE;
+                        }
+                        return;
+                    }
+                    if (currentAnimationGroup && currentAnimationGroup.isPlaying) {
+                        currentAnimationGroup.stop();
+                    }
+                    const animToPlay = animations[gestureName];
+                    currentAnimationGroup = animToPlay;
+                    currentGesture = gestureName;
+                    animToPlay.loopAnimation = loop;
+                    animToPlay.start(loop, speed, animToPlay.from, animToPlay.to, false);
+                    animToPlay.onAnimationEndObservable.clear(); 
+                    if (!loop && onEndCallback) {
+                        animToPlay.onAnimationEndObservable.addOnce(onEndCallback);
+                    } else if (!loop && gestureName !== animKeywordsConfig.IDLE) {
+                        animToPlay.onAnimationEndObservable.addOnce(() => {
+                            if (currentAnimationGroup === animToPlay) { 
+                                currentAnimationGroup = null; 
+                                currentGesture = null;
+                            }
+                        });
+                    }
+                },
+                getMesh: () => rootMesh
+            };
+            return handObject;
+        }
+        // --- End DesktopHand Object Definition ---
+
+        window.addEventListener('DOMContentLoaded', async function () {
+            const canvas = document.getElementById("renderCanvas");
+            if (!canvas) { console.error("Render canvas not found!"); return; }
+            const engine = new BABYLON.Engine(canvas, true);
+
+            const sceneState = {
+                camera: null, desktopHand: null, xrExperience: null,
+                currentHandPlaneDistance: DEFAULT_HAND_PLANE_DISTANCE,
+                previousDesktopHandPlaneDistance: undefined, 
+                draggableBox: null, currentDebugRayLine: null,
+                isPDBDraggingDraggableBox: false 
+            };
+
+            function showDebugRay(ray, scene, color = DEBUG_RAY_DEFAULT_COLOR, length = DEBUG_RAY_LENGTH, duration = DEBUG_RAY_DURATION) {
+                 if (sceneState.currentDebugRayLine) { sceneState.currentDebugRayLine.dispose(); }
+                const points = [ray.origin, ray.origin.add(ray.direction.scale(length))];
+                sceneState.currentDebugRayLine = BABYLON.MeshBuilder.CreateLines("debugRay", { points: points }, scene);
+                sceneState.currentDebugRayLine.color = color;
+                sceneState.currentDebugRayLine.isPickable = false;
+                console.log(`DEBUG RAY: Origin: ${ray.origin.toString()}, Direction: ${ray.direction.toString()}`);
+                setTimeout(() => {
+                    if (sceneState.currentDebugRayLine) {
+                        sceneState.currentDebugRayLine.dispose();
+                        sceneState.currentDebugRayLine = null;
+                    }
+                }, duration);
+            }
+
+            var createScene = async function () {
+                var scene = new BABYLON.Scene(engine);
+                sceneState.camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 5, -20), scene);
+                sceneState.camera.setTarget(new BABYLON.Vector3(0, 4.75, -19)); 
+                sceneState.camera.attachControl(canvas, true);
+                sceneState.camera.minZ = 0.1; sceneState.camera.maxZ = 1000;
+                scene.activeCamera = sceneState.camera;
+                console.log("DEBUG: Camera initialized.");
+
+                new BABYLON.HemisphericLight("light1", new BABYLON.Vector3(0, 1, 0), scene);
+                const dirLight = new BABYLON.DirectionalLight("dir01", new BABYLON.Vector3(0, -0.5, -1.0), scene);
+                dirLight.position = new BABYLON.Vector3(0, 5, 5);
+
+                const ground = BABYLON.MeshBuilder.CreateGround("ground1", { width: 20, height: 20 }, scene); 
+                ground.position.y = -1; ground.checkCollisions = true;
+                const groundMaterial = new BABYLON.StandardMaterial("groundMat", scene);
+                groundMaterial.diffuseColor = new BABYLON.Color3(0.5, 0.5, 0.5); 
+                ground.material = groundMaterial; ground.isPickable = true;
+
+                sceneState.desktopHand = createDesktopHand(scene, HAND_MODEL_URL, HAND_ANIMATION_KEYWORDS);
+                await sceneState.desktopHand.loadAsync(); 
+
+                if (sceneState.desktopHand.isLoaded) {
+                     const isInXR = sceneState.xrExperience && sceneState.xrExperience.baseExperience.state === BABYLON.WebXRState.IN_XR;
+                     sceneState.desktopHand.setVisible(!isInXR);
+                     if (sceneState.desktopHand.isVisible() && sceneState.camera) {
+                        let initialRay = scene.createPickingRay(engine.getRenderWidth() / 2, engine.getRenderHeight() / 2, BABYLON.Matrix.Identity(), sceneState.camera, false);
+                        sceneState.desktopHand.setPosition(initialRay.origin.add(initialRay.direction.scale(DEFAULT_HAND_PLANE_DISTANCE)));
+                        sceneState.currentHandPlaneDistance = DEFAULT_HAND_PLANE_DISTANCE;
+                     }
+                }
+
+                scene.createDefaultXRExperienceAsync({
+                    floorMeshes: [ground],
+                    pointerSelectionOptions: { enablePointerSelectionOnAllControllers: true, overrideButtonId: "xr-standard-squeeze" },
+                    inputOptions: { doNotLoadControllerMeshes: false }
+                }).then((xr) => {
+                    sceneState.xrExperience = xr; console.log("XR experience created.");
+                    if (sceneState.desktopHand && sceneState.desktopHand.isLoaded) { 
+                        const isInXR = sceneState.xrExperience.baseExperience.state === BABYLON.WebXRState.IN_XR;
+                        sceneState.desktopHand.setVisible(!isInXR);
+                        if (isInXR) {
+                            sceneState.previousDesktopHandPlaneDistance = sceneState.currentHandPlaneDistance; 
+                            sceneState.desktopHand.makeGesture(HAND_ANIMATION_KEYWORDS.IDLE); 
+                        }
+                    }
+                    sceneState.xrExperience.baseExperience.onStateChangedObservable.add((state) => {
+                        if (sceneState.desktopHand && sceneState.desktopHand.isLoaded) {
+                            sceneState.desktopHand.makeGesture(HAND_ANIMATION_KEYWORDS.IDLE); 
+                            const isNotInXR = state === BABYLON.WebXRState.NOT_IN_XR;
+                            sceneState.desktopHand.setVisible(isNotInXR);
+                            if (isNotInXR) {
+                                sceneState.currentHandPlaneDistance = (sceneState.previousDesktopHandPlaneDistance !== undefined)
+                                    ? sceneState.previousDesktopHandPlaneDistance : DEFAULT_HAND_PLANE_DISTANCE;
+                                sceneState.previousDesktopHandPlaneDistance = undefined; 
+                                if (scene.pointerX !== undefined && scene.pointerY !== undefined) {
+                                    let pointerRay = scene.createPickingRay(scene.pointerX, scene.pointerY, BABYLON.Matrix.Identity(), sceneState.camera, false);
+                                    let planeOrigin = sceneState.camera.position.add(sceneState.camera.getDirection(BABYLON.Vector3.Forward()).scale(sceneState.currentHandPlaneDistance));
+                                    let planeNormal = sceneState.camera.getDirection(BABYLON.Vector3.Forward());
+                                    let plane = new BABYLON.Plane(planeNormal.x, planeNormal.y, planeNormal.z, -BABYLON.Vector3.Dot(planeOrigin, planeNormal));
+                                    let distanceToPlane = pointerRay.intersectsPlane(plane);
+                                    let newPos = (distanceToPlane !== null && distanceToPlane > 0 && distanceToPlane < sceneState.camera.maxZ * 0.95)
+                                        ? pointerRay.origin.add(pointerRay.direction.scale(distanceToPlane))
+                                        : pointerRay.origin.add(pointerRay.direction.scale(sceneState.currentHandPlaneDistance));
+                                    if (newPos && !isNaN(newPos.x)) sceneState.desktopHand.setPosition(newPos);
+                                }
+                                console.log("Exited XR. Plane distance:", sceneState.currentHandPlaneDistance.toFixed(2));
+                            } else { 
+                                sceneState.previousDesktopHandPlaneDistance = sceneState.currentHandPlaneDistance;
+                                console.log("Entered XR. Saved plane distance:", sceneState.previousDesktopHandPlaneDistance?.toFixed(2));
+                            }
+                        }
+                    });
+                }).catch(error => console.error("Failed to create XR experience:", error));
+
+                sceneState.draggableBox = BABYLON.MeshBuilder.CreateBox(DRAGGABLE_BOX_NAME, { size: 1 }, scene);
+                sceneState.draggableBox.position.set(0, 0, 0); 
+                const boxMaterial = new BABYLON.StandardMaterial("boxMat", scene);
+                boxMaterial.diffuseColor = new BABYLON.Color3(0.8, 0.1, 0.8); 
+                sceneState.draggableBox.material = boxMaterial;
+                sceneState.draggableBox.isPickable = true;
+
+                const staticBox = BABYLON.MeshBuilder.CreateBox("staticBox", {size: 0.8}, scene);
+                staticBox.position.set(2, -0.1, 0.5); 
+                const staticBoxMat = new BABYLON.StandardMaterial("staticBoxMat", scene);
+                staticBoxMat.diffuseColor = new BABYLON.Color3(0.1, 0.8, 0.8); 
+                staticBox.material = staticBoxMat; staticBox.isPickable = true;
+
+                // MODIFIED: Simplified PointerDragBehavior constructor
+                const pointerDragBehavior = new BABYLON.PointerDragBehavior(); 
+                pointerDragBehavior.detachCameraControls = false; 
+
+                pointerDragBehavior.onDragStartObservable.add((event) => {
+                    const draggedMeshName = event.draggedMesh ? event.draggedMesh.name : "UNKNOWN (event.draggedMesh is null/undefined)";
+                    console.log(`PDB DRAG START: Mesh: '${draggedMeshName}'. Pointer ID: ${event.pointerId}. DraggedMesh object:`, event.draggedMesh);
+                    
+                    if (event.draggedMesh === sceneState.draggableBox) { // Direct object comparison
+                        sceneState.isPDBDraggingDraggableBox = true;
+                        if(sceneState.desktopHand) sceneState.desktopHand.setVisible(false); 
+                        console.log("PDB confirmed dragging sceneState.draggableBox.");
+                    } else {
+                        console.warn("PDB DRAG START for a mesh that is NOT sceneState.draggableBox:", event.draggedMesh);
+                    }
+                });
+                pointerDragBehavior.onDragEndObservable.add((event) => {
+                    const draggedMeshName = event.draggedMesh ? event.draggedMesh.name : "UNKNOWN (event.draggedMesh is null/undefined)";
+                    console.log(`PDB DRAG END: Mesh: '${draggedMeshName}'. Pointer ID: ${event.pointerId}`);
+
+                    if (event.draggedMesh === sceneState.draggableBox) { // Direct object comparison
+                        sceneState.isPDBDraggingDraggableBox = false;
+                        if (sceneState.camera) { 
+                            sceneState.currentHandPlaneDistance = BABYLON.Vector3.Distance(sceneState.camera.position, sceneState.draggableBox.position);
+                            if (sceneState.currentHandPlaneDistance < sceneState.camera.minZ + 0.1) {
+                                sceneState.currentHandPlaneDistance = sceneState.camera.minZ + 0.1;
+                            }
+                            console.log("Drag End (PDB for draggableBox): Updated currentHandPlaneDistance to:", sceneState.currentHandPlaneDistance.toFixed(3));
+                        }
+                        const isInXR = sceneState.xrExperience && sceneState.xrExperience.baseExperience.state === BABYLON.WebXRState.IN_XR;
+                        if(sceneState.desktopHand && !isInXR) {
+                            sceneState.desktopHand.setVisible(true);
+                        }
+                    }
+                });
+                sceneState.draggableBox.addBehavior(pointerDragBehavior);
+                console.log("PointerDragBehavior (no dragAxis) attached to draggableBox. Attached node:", pointerDragBehavior.attachedNode ? pointerDragBehavior.attachedNode.name : "null or not yet attached");
+
+
+                const pickPredicateDraggable = (mesh) => {
+                    return mesh.isPickable && mesh.behaviors.some(b => b.name === "PointerDrag");
+                };
+                
+                scene.onPointerObservable.add((pointerInfo) => {
+                    if (!sceneState.camera || !sceneState.desktopHand || !sceneState.desktopHand.isLoaded) return; 
+                    const isInXR = sceneState.xrExperience && sceneState.xrExperience.baseExperience.state === BABYLON.WebXRState.IN_XR;
+                    const processDesktopHandVisuals = !isInXR; 
+
+                    switch (pointerInfo.type) {
+                        case BABYLON.PointerEventTypes.POINTERMOVE:
+                            if (processDesktopHandVisuals && sceneState.desktopHand.isVisible() && !sceneState.isPDBDraggingDraggableBox) {
+                                let newHandPosition;
+                                let isPointerCurrentlyDown = pointerInfo.event.buttons !== 0;
+                                let pickInfoDraggable = null;
+                                if (!isPointerCurrentlyDown) {
+                                     pickInfoDraggable = scene.pick(scene.pointerX, scene.pointerY, pickPredicateDraggable);
+                                }
+                                if (pickInfoDraggable && pickInfoDraggable.hit && pickInfoDraggable.pickedPoint) {
+                                    let normal = pickInfoDraggable.getNormal(true, true); 
+                                    if (normal) {
+                                        let offsetDist = sceneState.desktopHand.getMesh().scaling.x * HAND_SNAP_OFFSET_FACTOR;
+                                        newHandPosition = pickInfoDraggable.pickedPoint.add(normal.scale(offsetDist));
+                                    } else { newHandPosition = pickInfoDraggable.pickedPoint.clone(); }
+                                    sceneState.currentHandPlaneDistance = BABYLON.Vector3.Distance(sceneState.camera.position, pickInfoDraggable.pickedPoint);
+                                    if (sceneState.currentHandPlaneDistance < sceneState.camera.minZ + 0.01) {
+                                        sceneState.currentHandPlaneDistance = sceneState.camera.minZ + 0.01;
+                                    }
+                                } else { 
+                                    let pointerRay = scene.createPickingRay(scene.pointerX, scene.pointerY, BABYLON.Matrix.Identity(), sceneState.camera, false);
+                                    let planeOrigin = sceneState.camera.position.add(sceneState.camera.getDirection(BABYLON.Vector3.Forward()).scale(sceneState.currentHandPlaneDistance));
+                                    let planeNormal = sceneState.camera.getDirection(BABYLON.Vector3.Forward());
+                                    let plane = new BABYLON.Plane(planeNormal.x, planeNormal.y, planeNormal.z, -BABYLON.Vector3.Dot(planeOrigin, planeNormal));
+                                    let distanceToPlane = pointerRay.intersectsPlane(plane);
+                                    newHandPosition = (distanceToPlane !== null && distanceToPlane > 0 && distanceToPlane < sceneState.camera.maxZ * 0.95)
+                                        ? pointerRay.origin.add(pointerRay.direction.scale(distanceToPlane))
+                                        : pointerRay.origin.add(pointerRay.direction.scale(sceneState.currentHandPlaneDistance));
+                                }
+                                if (newHandPosition && !isNaN(newHandPosition.x)) { 
+                                    sceneState.desktopHand.setPosition(newHandPosition);
+                                }
+                            }
+                            break;
+                        case BABYLON.PointerEventTypes.POINTERDOWN:
+                            console.log(`POINTERDOWN (Custom Obs): Pointer ID: ${pointerInfo.pointerId}, Button: ${pointerInfo.event.button}`);
+                            let directPickInfo = scene.pick(scene.pointerX, scene.pointerY,
+                                (mesh) => mesh.isPickable && mesh !== sceneState.desktopHand.getMesh() && (sceneState.desktopHand.getMesh() ? !mesh.isDescendantOf(sceneState.desktopHand.getMesh()) : true)
+                            );
+                            let pickedMesh = directPickInfo ? directPickInfo.pickedMesh : null;
+                            if (pickedMesh === sceneState.draggableBox) {
+                                console.log("POINTERDOWN (Custom Obs) on draggableBox. PDB will handle. No custom gesture by this observer.");
+                                if (directPickInfo && directPickInfo.hit) {
+                                     let ray = scene.createPickingRay(scene.pointerX, scene.pointerY, BABYLON.Matrix.Identity(), sceneState.camera, false);
+                                     showDebugRay(ray, scene, DEBUG_RAY_DRAG_CLICK_COLOR, DEBUG_RAY_LENGTH, DEBUG_RAY_DURATION_DRAG_CLICK);
+                                }
+                            } else if (processDesktopHandVisuals && sceneState.desktopHand.isVisible()) {
+                                console.log("POINTERDOWN (Custom Obs) on non-PDB mesh. Making POINT gesture.");
+                                sceneState.desktopHand.makeGesture(HAND_ANIMATION_KEYWORDS.POINT);
+                                if (pickedMesh) console.log(`POINTERDOWN (Custom Obs): Directly picked (non-PDB): ${pickedMesh.name}`);
+                            }
+                            break;
+                        case BABYLON.PointerEventTypes.POINTERUP:
+                            console.log(`POINTERUP (Custom Obs): Pointer ID: ${pointerInfo.pointerId}, Button: ${pointerInfo.event.button}`);
+                            if (processDesktopHandVisuals && sceneState.desktopHand.isVisible() && !sceneState.isPDBDraggingDraggableBox) {
+                                console.log("POINTERUP (Custom Obs). Making IDLE gesture.");
+                                sceneState.desktopHand.makeGesture(HAND_ANIMATION_KEYWORDS.IDLE);
+                            }
+                            break;
+                    }
+                }, BABYLON.PointerEventTypes.POINTERDOWN | BABYLON.PointerEventTypes.POINTERUP | BABYLON.PointerEventTypes.POINTERMOVE, false);
+
+                if (SHOW_INSPECTOR_BY_DEFAULT) {
+                    scene.debugLayer.show({ embedMode: true, globalRoot: document.body }).then(() => {
+                         console.log("Babylon.js Inspector is shown.");
+                    });
+                } else { console.log("Babylon.js Inspector is hidden by default."); }
+                return scene;
+            };
+            
+            createScene().then(sceneToRender => {
+                engine.runRenderLoop(function () {
+                    if (sceneToRender && sceneToRender.activeCamera) { sceneToRender.render(); }
+                    else if (sceneToRender && !sceneToRender.activeCamera) { console.error("RENDER LOOP ERROR: Scene has no active camera!"); }
+                });
+            });
+            window.addEventListener("resize", function () { engine.resize(); });
+        });
+    </script>
+</body>
+</html>
